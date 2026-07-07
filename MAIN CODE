@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""
+tor_chat.py — peer-to-peer text chat tunneled entirely through Tor.
+(single-file version: core logic + CLI mode + Textual terminal UI)
+"""
+
+import argparse
+import base64
+import os
+import socket
+import sys
+import threading
+
+# Defensive Dependency Imports
+
+try:
+    import socks  # PySocks
+except ImportError:
+    socks = None
+
+try:
+    import stem
+    from stem.control import Controller
+except ImportError:
+    stem = None
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+except ImportError:
+    Fernet = None
+
+try:
+    from textual import work
+    from textual.app import App, ComposeResult
+    from textual.containers import Vertical
+    from textual.widgets import Header, Footer, RichLog, Input, Static
+    TEXTUAL_AVAILABLE = True
+except ImportError:
+    TEXTUAL_AVAILABLE = False
+
+
+DEFAULT_SOCKS_PORT = 9050
+DEFAULT_CONTROL_PORT = 9051
+VIRTUAL_ONION_PORT = 8080  # port the onion service advertises to the world
+_SALT = b"tor-chat-fixed-salt-v1"
+
+
+# Crypto / identity helpers
+
+def derive_key(passphrase: str) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=_SALT,
+        iterations=390_000,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
+
+
+class Cipher:
+    """Optional extra encryption layer on top of the Tor transport."""
+    def __init__(self, passphrase):
+        if passphrase and not Fernet:
+            print("[!] cryptography library missing but --key was passed.", file=sys.stderr)
+            sys.exit(1)
+        self.fernet = Fernet(derive_key(passphrase)) if passphrase else None
+
+    def encrypt(self, line: str) -> bytes:
+        data = line.encode("utf-8")
+        if self.fernet:
+            data = self.fernet.encrypt(data)
+        return data + b"\n"
+
+    def decrypt(self, data: bytes):
+        data = data.rstrip(b"\n")
+        if self.fernet:
+            try:
+                data = self.fernet.decrypt(data)
+            except InvalidToken:
+                return None  # wrong passphrase / tampered message
+        return data.decode("utf-8", errors="replace")
+
+
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def load_identity(path: str):
+    try:
+        with open(path, "r") as f:
+            key_type, key_content = f.read().strip().split(":", 1)
+        return key_type, key_content
+    except (FileNotFoundError, ValueError):
+        return None, None
+
+
+def save_identity(path: str, key_type: str, key_content: str):
+    with open(path, "w") as f:
+        f.write(f"{key_type}:{key_content}")
+    os.chmod(path, 0o600)
+
+
+def normalize_onion_address(addr: str) -> str:
+    for prefix in ("http://", "https://"):
+        if addr.startswith(prefix):
+            addr = addr[len(prefix):]
+    return addr.rstrip("/")
+
+
+# Plain CLI mode
+
+def chat_loop_plain(sock: socket.socket, cipher: Cipher, label: str):
+    stop = threading.Event()
+
+    def receiver():
+        buf = b""
+        while not stop.is_set():
+            try:
+                chunk = sock.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                print("\n[connection closed by peer]")
+                stop.set()
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = cipher.decrypt(line + b"\n")
+                if text is None:
+                    print("\n[!] received a message that failed to decrypt (wrong --key?), discarding")
+                else:
+                    print(f"\rpeer> {text}\nyou> ", end="", flush=True)
+
+    t = threading.Thread(target=receiver, daemon=True)
+    t.start()
+
+    print(f"[{label}] connected. Type messages and hit enter. Ctrl-C to quit.")
+    try:
+        while not stop.is_set():
+            line = input("you> ")
+            if stop.is_set():
+                break
+            try:
+                sock.sendall(cipher.encrypt(line))
+            except OSError:
+                print("[connection lost]")
+                break
+    except (KeyboardInterrupt, EOFError):
+        print("\n[closing]")
+    finally:
+        stop.set()
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+
+
+def cmd_host_plain(args):
+    if not stem:
+        print("[!] stem library is required to host: pip install stem", file=sys.stderr)
+        sys.exit(1)
+
+    local_port = find_free_port()
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("127.0.0.1", local_port))
+    server_sock.listen(1)
+
+    print(f"[*] local listener up on 127.0.0.1:{local_port}")
+    print(f"[*] contacting Tor control port at 127.0.0.1:{args.control_port} ...")
+
+    try:
+        controller = Controller.from_port(port=args.control_port)
+        controller.authenticate()
+    except Exception as e:
+        print(f"[!] Tor control connection/authentication failed: {e}")
+        server_sock.close()
+        sys.exit(1)
+
+    key_type, key_content = "NEW", "BEST"
+    reusing = False
+    if args.persist:
+        saved_type, saved_content = load_identity(args.persist)
+        if saved_type:
+            key_type, key_content = saved_type, saved_content
+            reusing = True
+            print(f"[*] reusing saved identity from {args.persist}")
+
+    print("[*] asking Tor to publish the onion service...")
+    try:
+        response = controller.create_ephemeral_hidden_service(
+            {VIRTUAL_ONION_PORT: local_port},
+            key_type=key_type,
+            key_content=key_content,
+            await_publication=True,
+        )
+        onion_address = f"{response.service_id}.onion"
+    except Exception as e:
+        print(f"[!] Failed to create onion service: {e}")
+        controller.close()
+        server_sock.close()
+        sys.exit(1)
+
+    if args.persist and not reusing:
+        save_identity(args.persist, response.private_key_type, response.private_key)
+
+    print("=" * 60)
+    print(f"  Your onion address:  {onion_address}:{VIRTUAL_ONION_PORT}")
+    print("=" * 60)
+    print("[*] waiting for your contact to connect...")
+
+    try:
+        conn, _ = server_sock.accept()
+        cipher = Cipher(args.key)
+        chat_loop_plain(conn, cipher, "host")
+    finally:
+        try:
+            controller.remove_ephemeral_hidden_service(response.service_id)
+        except Exception:
+            pass
+        controller.close()
+        server_sock.close()
+
+
+def cmd_connect_plain(args):
+    if socks is None:
+        print("[!] PySocks is required: pip install pysocks", file=sys.stderr)
+        sys.exit(1)
+
+    onion_address = normalize_onion_address(args.onion_address)
+    print(f"[*] connecting to {onion_address}:{args.port} via Tor...")
+
+    s = socks.socksocket()
+    s.set_proxy(socks.SOCKS5, "127.0.0.1", args.socks_port)
+    s.settimeout(120)
+    try:
+        s.connect((onion_address, args.port))
+        s.settimeout(None)
+    except Exception as e:
+        print(f"[!] connection failed: {e}")
+        s.close()
+        sys.exit(1)
+
+    cipher = Cipher(args.key)
+    chat_loop_plain(s, cipher, "connect")
+
+
+# Textual terminal UI mode
+
+if TEXTUAL_AVAILABLE:
+
+    class ChatApp(App):
+        CSS = """
+        Screen { background: $background; }
+        #status { dock: top; height: 1; background: $primary-darken-2; color: $text; padding: 0 1; content-align: left middle; }
+        #log { border: round $primary; background: $surface; padding: 0 1; }
+        #msg_input { dock: bottom; border: round $accent; }
+        """
+        BINDINGS = [("ctrl+q", "quit", "Quit")]
+
+        def __init__(self, args):
+            super().__init__()
+            self.args = args
+            self.cipher = Cipher(args.key)
+            self.sock = None
+            self.server_sock = None
+            self.controller = None
+            self.response = None
+            self.title = "tor_chat"
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield Static("starting up...", id="status")
+            yield Vertical(RichLog(id="log", wrap=True, highlight=False, markup=False, auto_scroll=True))
+            yield Input(placeholder="Type a message and press Enter... (Ctrl+Q to quit)", id="msg_input")
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self.query_one("#msg_input", Input).focus()
+            if self.args.command == "host":
+                self.setup_host()
+            else:
+                self.setup_connect()
+
+        def set_status(self, text: str) -> None:
+            self.query_one("#status", Static).update(text)
+
+        def log_line(self, text: str) -> None:
+            self.query_one("#log", RichLog).write(text)
+
+        def on_unmount(self) -> None:
+            """Clean up open system and network assets cleanly when TUI closes."""
+            if self.sock:
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.sock.close()
+            if self.server_sock:
+                self.server_sock.close()
+            if self.controller and self.response:
+                try:
+                    self.controller.remove_ephemeral_hidden_service(self.response.service_id)
+                except Exception:
+                    pass
+                self.controller.close()
+
+        @work(thread=True, exclusive=True)
+        def setup_host(self) -> None:
+            if not stem:
+                self.call_from_thread(self.log_line, "[!] stem is missing: pip install stem")
+                return
+
+            local_port = find_free_port()
+            self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_sock.bind(("127.0.0.1", local_port))
+            self.server_sock.listen(1)
+
+            self.call_from_thread(self.log_line, f"[*] local listener up on 127.0.0.1:{local_port}")
+            self.call_from_thread(self.set_status, "contacting Tor control port...")
+
+            try:
+                self.controller = Controller.from_port(port=self.args.control_port)
+                self.controller.authenticate()
+            except Exception as e:
+                self.call_from_thread(self.log_line, f"[!] Tor control port error: {e}")
+                self.server_sock.close()
+                return
+
+            key_type, key_content = "NEW", "BEST"
+            reusing = False
+            if self.args.persist:
+                saved_type, saved_content = load_identity(self.args.persist)
+                if saved_type:
+                    key_type, key_content, reusing = saved_type, saved_content, True
+
+            self.call_from_thread(self.set_status, "publishing onion service...")
+            try:
+                self.response = self.controller.create_ephemeral_hidden_service(
+                    {VIRTUAL_ONION_PORT: local_port},
+                    key_type=key_type,
+                    key_content=key_content,
+                    await_publication=True,
+                )
+                onion_address = f"{self.response.service_id}.onion"
+            except Exception as e:
+                self.call_from_thread(self.log_line, f"[!] Ephemeral setup failed: {e}")
+                return
+
+            if self.args.persist and not reusing:
+                save_identity(self.args.persist, self.response.private_key_type, self.response.private_key)
+
+            self.call_from_thread(self.log_line, f"[*] onion address: {onion_address}:{VIRTUAL_ONION_PORT}")
+            self.call_from_thread(self.set_status, f"waiting for peer @ {onion_address} ...")
+
+            try:
+                conn, _ = self.server_sock.accept()
+                self.sock = conn
+                self.call_from_thread(self.set_status, f"connected -- {onion_address}")
+                self.call_from_thread(self.log_line, "[*] peer connected!")
+                self._receive_loop()
+            except OSError:
+                pass  # Occurs when the socket drops from exiting via unmount
+
+        @work(thread=True, exclusive=True)
+        def setup_connect(self) -> None:
+            if socks is None:
+                self.call_from_thread(self.log_line, "[!] PySocks missing: pip install pysocks")
+                return
+
+            onion_address = normalize_onion_address(self.args.onion_address)
+            self.call_from_thread(self.set_status, f"connecting to {onion_address}...")
+
+            s = socks.socksocket()
+            s.set_proxy(socks.SOCKS5, "127.0.0.1", self.args.socks_port)
+            s.settimeout(120)
+            try:
+                s.connect((onion_address, self.args.port))
+                s.settimeout(None)
+                self.sock = s
+                self.call_from_thread(self.set_status, f"connected -- {onion_address}")
+                self.call_from_thread(self.log_line, "[*] connected!")
+                self._receive_loop()
+            except Exception as e:
+                self.call_from_thread(self.log_line, f"[!] connection failed: {e}")
+                self.call_from_thread(self.set_status, "failed")
+                s.close()
+
+        def _receive_loop(self) -> None:
+            buf = b""
+            while True:
+                try:
+                    chunk = self.sock.recv(4096)
+                except OSError:
+                    break
+                if not chunk:
+                    self.call_from_thread(self.log_line, "[connection closed by peer]")
+                    self.call_from_thread(self.set_status, "disconnected")
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    text = self.cipher.decrypt(line + b"\n")
+                    if text is None:
+                        self.call_from_thread(self.log_line, "[!] message failed decryption (wrong key?)")
+                    else:
+                        self.call_from_thread(self.log_line, f"peer> {text}")
+
+        def on_input_submitted(self, event) -> None:
+            text = event.value
+            event.input.value = ""
+            if not text:
+                return
+            if self.sock is None:
+                self.log_line("[!] not connected yet -- message dropped")
+                return
+            try:
+                self.sock.sendall(self.cipher.encrypt(text))
+                self.log_line(f"you> {text}")
+            except OSError:
+                self.log_line("[!] send failed, connection dead")
+
+
+# --------------------------------------------------------------------------
+# Main Execution Entry Point
+# --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="P2P chat over Tor onion services.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_host = sub.add_parser("host", help="wait for a peer to connect to you")
+    p_host.add_argument("--control-port", type=int, default=DEFAULT_CONTROL_PORT)
+    p_host.add_argument("--key", default=None)
+    p_host.add_argument("--persist", metavar="FILE", default=None)
+    p_host.add_argument("--plain", action="store_true")
+
+    p_conn = sub.add_parser("connect", help="connect out to a peer's onion address")
+    p_conn.add_argument("onion_address")
+    p_conn.add_argument("--port", type=int, default=VIRTUAL_ONION_PORT)
+    p_conn.add_argument("--socks-port", type=int, default=DEFAULT_SOCKS_PORT)
+    p_conn.add_argument("--key", default=None)
+    p_conn.add_argument("--plain", action="store_true")
+
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    use_plain = args.plain or not TEXTUAL_AVAILABLE
+
+    if not TEXTUAL_AVAILABLE and not args.plain:
+        print("[*] Textual isn't installed -- falling back to plain mode.")
+
+    if use_plain:
+        if args.command == "host":
+            cmd_host_plain(args)
+        else:
+            cmd_connect_plain(args)
+    else:
+        app = ChatApp(args)
+        app.run()
+
+
+if __name__ == "__main__":
+    main()
