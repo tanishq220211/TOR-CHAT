@@ -1,6 +1,6 @@
 # tor_chat
 
-A peer-to-peer, end-to-end encrypted terminal chat application routed entirely through the Tor anonymity network. No central servers, no registration, and no tracking.
+tor_chat: A serverless P2P chat routing encrypted traffic via Tor Onion Services. Features a dual-layer Fernet cipher, a split-pane Textual TUI, and a CLI fallback for secure terminal communication.
 
 ---
 
@@ -17,8 +17,8 @@ A peer-to-peer, end-to-end encrypted terminal chat application routed entirely t
 This project requires a working installation of Python 3 and the Tor daemon on your machine.
 
 ### 1. Install System Dependencies (Linux - Ubuntu/Zorin)
-First, ensure your package manager is up to date and install the native Tor service: 
-
+First, ensure your package manager is up to date and install the native Tor service:
+```bash
 sudo apt update
 sudo apt install tor -y
 2. Install Python Packages
@@ -81,4 +81,4 @@ Advanced Connect Options:
 Connect using the matching passphrase:
 
 Bash
-python3 torchatmadebythesmartestpersonalive.py connect <onion_address> --key "your secret passphrase"
+python3 torchatmadebythesmartestpersonalive.py connect <onion_address> --key "your
